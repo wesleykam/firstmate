@@ -1,0 +1,48 @@
+fm-fleet-snapshot.sh --contribution-input live reproduction
+=============================================================
+Goal: reproduce the reported "Argument list too long" crash end-to-end with
+the real jq binary and the real kernel ARG_MAX (getconf ARG_MAX = 2097152 on
+this host), then confirm the fix on the target commit using the same FM_HOME.
+
+Fixture: FM_HOME/data/backlog.md with 15,000 queued rows (1,563,927 bytes of
+source markdown), run with `env -i PATH=/usr/bin:/bin FM_HOME=... <script>
+--contribution-input`.
+
+--- base commit b062eb94c50a68dd4467fba25346a7d7b4083288 (pre-fix) ---
+$ fm-fleet-snapshot.sh --contribution-input
+exit=0
+stdout: 0 bytes
+stderr: fm-fleet-snapshot.sh: line 1997: /usr/bin/jq: Argument list too long
+
+Bug reproduced exactly as reported: the contribution-input branch built its
+jq invocation with `--argjson backlog "$BACKLOG_JSON"`, passing the full
+backlog JSON as a single argv entry. With 15k rows this exceeds ARG_MAX, the
+exec of jq fails, and because the script's `exit 0` on the next line runs
+unconditionally, the failure is swallowed: exit 0 with silently empty stdout.
+
+--- target commit bae290328e90ccacc499011bb53c5a54f2e4bc8b (fix) ---
+$ fm-fleet-snapshot.sh --contribution-input
+exit=0
+stdout: 17,126,820 bytes
+stderr: (empty)
+$ jq -e '(.backlog.records | length) == 15000' out.json  => true
+
+Fixed: backlog/task JSON is now written to temp files and read back with
+`--slurpfile`, so the jq argv no longer scales with backlog size. Same
+FM_HOME, same 15,000-row backlog, now succeeds and emits complete, valid JSON.
+
+--- fail-loud guard (bae2903's second fix on top of 29cdc08) ---
+Fault-injected a jq wrapper that fails only on the final contribution-input
+assembly call (`jq -n --slurpfile ... '{backlog:$backlog[0],tasks:$tasks[0]}'`),
+small backlog, same FM_HOME for both:
+
+commit 29cdc08 (file-transport added, no guard yet):
+  exit=0, stdout 0 bytes, stderr "jq: simulated assembly failure"
+  -> silently reports success despite the jq failure.
+
+commit bae2903 (target, guard added):
+  exit=1, stdout 0 bytes
+  stderr:
+    jq: simulated assembly failure
+    fm-fleet-snapshot: contribution input assembly failed
+  -> fails loudly as intended.
